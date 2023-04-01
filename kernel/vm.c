@@ -15,6 +15,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+extern int pageref[];
+
 // Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
@@ -303,22 +305,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if(*pte & PTE_W)
+    {
+      *pte &= ~PTE_W;
+      *pte |= PTE_COW;
+    }
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       goto err;
     }
+    kref_inc(pa);
   }
   return 0;
 
@@ -350,6 +356,14 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(checkcow(pagetable, va0)==0)
+    {
+      if(uvmcow(pagetable, va0)<0)
+      {
+        printf("copyout uvmcow failed\n");
+        return -1;
+      }
+    }
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -358,7 +372,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       n = len;
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
-    len -= n;
+    len -= n; 
     src += n;
     dstva = va0 + PGSIZE;
   }
@@ -431,4 +445,48 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+int
+checkcow(pagetable_t p,uint64 va)
+{
+  pte_t *pte;
+  if((pte = walk(p, va, 0)) == 0)
+    return -1;
+  if(va>MAXVA)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_COW) == 0)
+    return -1;
+  return 0;
+}
+
+int 
+uvmcow(pagetable_t p, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa,pa_n;
+  uint flags;
+
+  if((pte = walk(p, va, 0)) == 0)
+    return -1;
+  
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+  pa_n = kpage(pa);
+  if(pa_n==0)
+    return -1;
+  if(pa==pa_n)
+  {
+    *pte &= ~PTE_COW;
+    *pte |= PTE_W;
+  } else {
+    flags &= ~PTE_COW;
+    flags |= PTE_W;
+    uvmunmap(p, PGROUNDDOWN(va), 1, 0);
+    if(mappages(p, PGROUNDDOWN(va),PGSIZE, pa_n, flags)!=0)
+      return -1;
+  }
+  return 0;
 }
