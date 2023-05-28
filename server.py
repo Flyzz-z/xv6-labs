@@ -10,4 +10,5 @@ while True:
     buf, raddr = sock.recvfrom(4096)
     print(buf.decode("utf-8"), file=sys.stderr)
     if buf:
+        #print(raddr, file=sys.stderr)
         sent = sock.sendto(b'this is the host!', raddr)
