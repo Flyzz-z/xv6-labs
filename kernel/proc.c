@@ -6,6 +6,13 @@
 #include "proc.h"
 #include "defs.h"
 
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+
+#define LAB_MMAP 1
+#include "fcntl.h"
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -53,6 +60,7 @@ procinit(void)
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->kstack = KSTACK((int) (p - proc));
+      p->vmaaera->valid = 0;
   }
 }
 
@@ -301,6 +309,13 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  for(int i=0;i<16;i++) {
+    if(p->vmaaera[i].valid) {
+      np->vmaaera[i] = p->vmaaera[i];
+      filedup(np->vmaaera[i].file);
+    }
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -351,6 +366,48 @@ exit(int status)
       fileclose(f);
       p->ofile[fd] = 0;
     }
+  }
+
+  struct vmaaera *vma;
+  for(int i=0;i<16;i++) {
+    vma = &p->vmaaera[i];
+    if(!vma->valid)
+      continue;
+    for(uint64 j = vma->addr;j<vma->addr+vma->length;j+=PGSIZE) {
+      pte_t *pte = walk(p->pagetable, j,0);
+      if(pte==0||!(*pte&PTE_V)) 
+        continue;
+      if (PTE_FLAGS(*pte) == PTE_V)
+        continue;
+      if((*pte&PTE_D)&&(vma->flag&MAP_SHARED)) {
+          int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+          int u = 0,n = PGSIZE,r=0;
+          struct file *f = vma->file;
+          while(u < n){
+            int n1 = n - u;
+            if(n1 > max)
+              n1 = max;
+
+            begin_op();
+            ilock(f->ip);
+            r = writei(f->ip, 0, PTE2PA(*pte)+u, j-vma->addr+u, n1);
+            iunlock(f->ip);
+            end_op();
+
+            if(r != n1){
+              // error from writei
+              break;
+            }
+            u += r;
+          }
+      }
+      //writei(vma->file->ip, 0, PTE2PA(*pte), j-vma->addr, PGSIZE);
+      uint64 pa = PTE2PA(*pte);
+      kfree((void *)pa);
+      *pte = 0;
+    }
+    fileclose(vma->file);
+    vma->valid = 0;
   }
 
   begin_op();

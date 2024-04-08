@@ -5,6 +5,12 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+
+#define LAB_MMAP 1
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -47,6 +53,7 @@ usertrap(void)
 
   struct proc *p = myproc();
   
+  
   // save user program counter.
   p->trapframe->epc = r_sepc();
   
@@ -67,6 +74,48 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 13 || r_scause() == 15) {
+    struct proc *p = myproc();
+    struct vmaaera *vma = 0;
+    uint64 addr = r_stval();
+    char *mem;
+    int perm = PTE_V|PTE_U;
+    for(int i=0;i<16;i++) {
+      vma = &p->vmaaera[i];
+      if(vma->valid==1&&addr>=vma->addr&&addr<vma->addr+vma->length) {
+      
+        //printf("addr %x vma %x\n",addr,vma->addr);
+        mem = kalloc();
+        if(mem == 0) {
+          p->killed = 1;
+          exit(-1);
+        }
+        memset(mem,0,PGSIZE);
+        if(vma->prot&PROT_READ)
+          perm |= PTE_R;
+        if(vma->prot&PROT_WRITE)
+          perm |= PTE_W;
+        // ilock(vma->file->ip);
+        // char *b = kalloc();
+        // readi(vma->file->ip, 0, (uint64)b, 0, 10);
+        // printf("%s\n",b);
+        // printf("%x\n",vma->file);
+        // iunlock(vma->file->ip);
+        //printf("%x\n",(uint64)vma->file->ip);
+        if(mappages(p->pagetable, PGROUNDDOWN(addr), PGSIZE, (uint64)mem, perm)!=0) {
+          kfree(mem);
+          p->killed = 1;
+          exit(-1);
+        }
+
+        ilock(vma->file->ip);
+        readi(vma->file->ip, 0, (uint64)mem, PGROUNDDOWN(addr) - vma->addr, PGSIZE);
+        iunlock(vma->file->ip);
+       
+        break;
+      }
+    }
+
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

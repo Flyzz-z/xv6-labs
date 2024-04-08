@@ -7,6 +7,11 @@
 #include "spinlock.h"
 #include "proc.h"
 
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
+
 uint64
 sys_exit(void)
 {
@@ -94,4 +99,128 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64 
+sys_mmap(void)
+{
+  uint64 addr;
+  int length,prot,flags,fd;
+  if(argaddr(0, &addr) < 0)
+    return -1;
+  if(argint(1, &length) < 0)
+    return -1;
+  if(argint(2, &prot) < 0)
+    return -1;
+  if(argint(3, &flags) < 0)
+    return -1;
+  if(argint(4, &fd) < 0)
+    return -1;
+  
+  struct proc *p = myproc();
+  if(fd>=NOFILE||p->ofile[fd]==0)
+    return -1;
+  if((prot&PROT_READ)&&!p->ofile[fd]->readable)
+    return -1;
+  if((flags&MAP_SHARED)&&(prot&PROT_WRITE)&&!p->ofile[fd]->writable)
+    return -1;
+  // add record
+  if(!p->vmasz)
+    p->vmasz = 0x40000000;
+  addr = p->vmasz;
+  p->vmasz = PGROUNDUP((addr + length));
+
+  //struct vmaaera *vma = 0;
+  for(int i=0;i<16;i++) {
+    if(!p->vmaaera[i].valid) {
+      //printf("i %d\n",i);
+      p->vmaaera[i].addr = addr;
+      p->vmaaera[i].length = length;
+      p->vmaaera[i].prot = prot;
+      p->vmaaera[i].flag = flags;
+      p->vmaaera[i].file = p->ofile[fd];
+      filedup(p->vmaaera[i].file);
+      //printf("%x\n",(uint64)p->vmaaera[i].file->ip);
+      p->vmaaera[i].valid = 1;
+     // vma = &p->vmaaera[i];
+      break;
+    }
+  }
+
+  //check vma file
+  // ilock(vma->file->ip);
+  // char *b = kalloc();
+  // readi(vma->file->ip, 0, (uint64)b, 0, 10);
+  // printf("%s\n",b);
+  // printf("%x\n",vma->file);
+  // iunlock(vma->file->ip);
+  //printf("addr %x\n",addr);
+  return addr;
+}
+
+uint64 
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+  if(argaddr(0, &addr)<0)
+    return -1;
+  if(argint(1, &length)<0)
+    return -1;
+  
+  struct proc *p = myproc();
+  struct  vmaaera *vma;
+
+  for(int i=0;i<16;i++) {
+    vma = &p->vmaaera[i];
+    if(!vma->valid)
+      continue;
+    if(addr<vma->addr||addr>=vma->addr+vma->length)
+      continue;
+    for(uint64 j = addr;j<addr+length;j+=PGSIZE) {
+      pte_t *pte = walk(p->pagetable, j,0);
+      if(pte==0||!(*pte&PTE_V)) 
+        continue;
+      if (PTE_FLAGS(*pte) == PTE_V)
+        continue;
+      // if((*pte&PTE_D)&&(vma->flag&MAP_SHARED))
+      //   writei(vma->file->ip, 0, PTE2PA(*pte), j-vma->addr, PGSIZE);
+      if((*pte&PTE_D)&&(vma->flag&MAP_SHARED)) {
+        int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+        int u = 0,n = PGSIZE,r=0;
+        struct file *f = vma->file;
+        while(u < n){
+          int n1 = n - u;
+          if(n1 > max)
+            n1 = max;
+
+          begin_op();
+          ilock(f->ip);
+          r = writei(f->ip, 0, PTE2PA(*pte)+u, j-vma->addr+u, n1);
+          iunlock(f->ip);
+          end_op();
+
+          if(r != n1){
+            // error from writei
+            break;
+          }
+          u += r;
+        }
+      }
+      uint64 pa = PTE2PA(*pte);
+      kfree((void *)pa);
+      *pte = 0;
+    }
+    if(addr == vma->addr&&length == vma->length) {
+      fileclose(vma->file);
+      vma->valid = 0;
+    } else if(addr == vma->addr) {
+      vma->addr = addr + length;
+      vma->length -= length;
+    } else if(addr+length == vma->addr+vma->length) {
+      vma->length = vma->length - length;
+    }
+  
+  }
+  return 0;
 }
